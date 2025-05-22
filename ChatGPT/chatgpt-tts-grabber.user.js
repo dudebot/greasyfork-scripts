@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         ChatGPT TTS Grabber
-// @namespace    https://github.com/dudebot/
+// @namespace    https://github.com/dudebot/greasyfork-scripts/tree/main/ChatGPT
 // @version      1.0.0
 // @description  Automatically downloads ChatGPT's TTS audio whenever playback is triggered.
 // @author       dudebot
@@ -9,13 +9,6 @@
 // @match        https://chat.openai.com/*
 // @match        https://chatgpt.com/*
 // @grant        none
-// ==/UserScript==
-
-// ==UserScript== Extended Description ==
-// This script captures and automatically downloads the TTS audio played by ChatGPT.
-// It works by hooking into the browser's MediaSource API to reconstruct streamed audio,
-// saving each playback as a downloadable file (e.g., .webm or .aac).
-//
 // ==/UserScript==
 
 (() => {
