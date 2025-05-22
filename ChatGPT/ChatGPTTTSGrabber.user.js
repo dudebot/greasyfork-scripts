@@ -11,6 +11,13 @@
 // @grant        none
 // ==/UserScript==
 
+// ==UserScript== Extended Description ==
+// This script captures and automatically downloads the TTS audio played by ChatGPT.
+// It works by hooking into the browser's MediaSource API to reconstruct streamed audio,
+// saving each playback as a downloadable file (e.g., .webm or .aac).
+//
+// ==/UserScript==
+
 (() => {
   const OrigMS = window.MediaSource;
   window.MediaSource = function() {
