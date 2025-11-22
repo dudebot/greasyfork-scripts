@@ -4,16 +4,17 @@ A Tampermonkey/Greasemonkey userscript that **automatically captures and downloa
 
 ## ✨ Features
 
-- 🔊 Automatically detects and downloads audio streamed via ChatGPT’s voice feature (including Glimmer and other voices)
+- 🔊 Automatically detects and downloads audio streamed via ChatGPT’s voice feature (including glimmer and other voices)
 - 📥 Captures streamed audio via Media Source Extensions (MSE), even if traditional fetch hooks fail
-- 🐒 Works with Tampermonkey or any UserScript-compatible extension
+- 🐒 Works with tampermonkey or any userscript-compatible extension
 - 💡 Compatible with both `chat.openai.com` and `chatgpt.com`
+- 📝 Names your audio files based on the chat title
 
 ## 📦 Installation
 
-1. Install [Tampermonkey](https://www.tampermonkey.net/) (or similar userscript manager)
-2. Install the script via [GreasyFork](https://greasyfork.org/) (link coming soon) or from [this GitHub repo](https://github.com/dudebot/chatgpt-tts-downloader)
-3. Visit [ChatGPT](https://chat.openai.com) and use the voice playback feature as usual
+1. Install [tampermonkey](https://www.tampermonkey.net/) (or similar userscript manager)
+2. Install the script via greasyfork (link coming soon) or from the github repo
+3. Visit chatgpt and use the voice playback feature as usual
 4. Watch your browser download the audio automatically as `.webm`, `.mp3`, or `.aac` files
 
 ## ⚙️ How It Works
@@ -22,14 +23,46 @@ ChatGPT uses Media Source Extensions (MSE) to stream TTS audio to its player. Th
 
 This approach works even if the audio is **streamed directly** and not returned as a traditional file from the server.
 
+### 🔤 filename detection
+
+The script also intercepts chatgpt’s internal request:
+
+`POST https://chatgpt.com/ces/v1/t`
+
+From that request body, it extracts:
+
+```
+context.page.title
+```
+
+Then it:
+
+- trims it  
+- replaces spaces with underscores  
+- strips unsafe characters  
+- falls back to the document title or `chatgpt` if missing  
+
+This produces a clean prefix used in the file:
+
+```
+<chat_title>-<timestamp>.<ext>
+```
+
+So instead of `chatgpt-12345.aac`, you'll get something like:
+
+```
+weekend_plans_chat-1732300203948.aac
+```
+
 ## 🧪 Known Limitations
 
 - May not work if ChatGPT changes its audio streaming pipeline to an AudioWorklet or encrypted transport
-- Audio is auto-downloaded for every playback (no opt-out UI yet)
+- Filenames rely on the `/ces/v1/t` analytics request remaining consistent
+- If interception fails, the script falls back to a generic name
 
 ## 🛠 Contributing
 
-Feel free to fork or submit issues and improvements on [GitHub](https://github.com/dudebot/chatgpt-tts-downloader).
+Feel free to fork or submit improvements on github.
 
 ## 📄 License
 
