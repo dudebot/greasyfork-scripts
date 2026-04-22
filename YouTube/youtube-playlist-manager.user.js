@@ -4,7 +4,9 @@
 // @version      0.1.0
 // @description  Bulk copy/move videos across playlists with checkboxes. Export/import playlists as JSON. The missing YouTube power-user tool.
 // @author       dudebot
-// @match        https://www.youtube.com/*
+// @match        https://www.youtube.com/playlist*
+// @match        https://www.youtube.com/feed/liked*
+// @match        https://www.youtube.com/watch*
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_deleteValue
