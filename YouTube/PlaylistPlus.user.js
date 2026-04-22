@@ -1,16 +1,11 @@
 // ==UserScript==
-// @name         YouTube Playlist Manager
+// @name         PlaylistPlus
 // @namespace    https://github.com/dudebot/greasyfork-scripts
-// @version      0.1.0
+// @version      0.1.3
 // @description  Bulk copy/move videos across playlists with checkboxes. Export/import playlists as JSON. The missing YouTube power-user tool.
 // @author       dudebot
-// @match        https://www.youtube.com/playlist*
-// @match        https://www.youtube.com/feed/liked*
-// @match        https://www.youtube.com/watch*
-// @grant        GM_setValue
-// @grant        GM_getValue
-// @grant        GM_deleteValue
-// @grant        GM_listValues
+// @match        https://www.youtube.com/*
+// @grant        none
 // @run-at       document-idle
 // @license      MIT
 // ==/UserScript==
@@ -182,6 +177,13 @@
       if (!k) throw new Error('INNERTUBE_API_KEY missing');
       return k;
     },
+
+    // Stable identity string for the currently-active YouTube account. Covers
+    // both multi-Google-login (SESSION_INDEX differs) and brand/channel
+    // accounts (DELEGATED_SESSION_ID differs under the same Google account).
+    identityTag() {
+      return `${this.ytcfgGet('SESSION_INDEX') || 0}|${this.ytcfgGet('DELEGATED_SESSION_ID') || ''}`;
+    },
   };
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -199,6 +201,11 @@
         'X-Youtube-Client-Name': String(auth.ytcfgGet('INNERTUBE_CONTEXT_CLIENT_NAME') || 1),
         'X-Youtube-Client-Version': auth.ytcfgGet('INNERTUBE_CONTEXT_CLIENT_VERSION') || '2.0',
       };
+      // Brand/channel accounts under a Google account are identified by
+      // DELEGATED_SESSION_ID. Without X-Goog-PageId, YouTube auths the
+      // request as the parent Google account instead of the brand.
+      const pageId = auth.ytcfgGet('DELEGATED_SESSION_ID');
+      if (pageId) headers['X-Goog-PageId'] = pageId;
       const ctx = auth.context();
       const payload = { context: ctx, ...body };
       if (isWrite) await pacing.writeGate();
@@ -632,6 +639,8 @@
       window.addEventListener('yt-navigate-finish', () => {
         this._selected.clear();
         this._emit();
+        ui._updateVisibility();
+        ui._refreshAcct();
         setTimeout(() => this.injectCheckboxes(), 500);
       });
     },
@@ -645,6 +654,7 @@
     _shadow: null,
     _el: {},
     _ownedPlaylists: [],
+    _ownedPlaylistsTag: null,
     _log: [],
 
     _logMsg(msg, kind = 'info') {
@@ -655,9 +665,9 @@
 
     _renderLog() {
       if (!this._el.log) return;
-      this._el.log.innerHTML = this._log.slice(-10).reverse().map(e =>
+      setHTML(this._el.log, this._log.slice(-10).reverse().map(e =>
         `<div class="log-${e.kind}">${escapeHtml(e.msg)}</div>`
-      ).join('');
+      ).join(''));
     },
 
     mount() {
@@ -668,7 +678,7 @@
       this._shadow = this._root.attachShadow({ mode: 'open' });
       document.body.appendChild(this._root);
 
-      this._shadow.innerHTML = `
+      setHTML(this._shadow, `
         <style>
           :host { all: initial; }
           .panel {
@@ -685,6 +695,7 @@
           .panel.collapsed .badge { display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; font-size: 20px; font-weight: bold; color: #f00; }
           .header { display:flex; align-items:center; padding: 8px 12px; border-bottom: 1px solid #3a3a3a; gap: 8px; }
           .title { flex: 1; font-weight: 600; }
+          .acct { font-weight: 400; font-size: 11px; color: #888; margin-left: 4px; }
           .count { font-variant-numeric: tabular-nums; color: #f00; font-weight: 600; }
           button.icon { background:none;border:none;color:#ccc;cursor:pointer;padding:4px 6px; font-size:14px; }
           button.icon:hover { color:#fff; }
@@ -694,7 +705,9 @@
           button.btn.primary { background:#c00; color:#fff; }
           button.btn.primary:hover { background:#e00; }
           button.btn:disabled { opacity:.5; cursor:not-allowed; }
-          .destpicker { max-height: 180px; overflow:auto; padding: 4px 12px; }
+          .destpicker { padding: 4px 12px; display:flex; flex-direction:column; }
+          .destpicker .dest-list { max-height: 180px; overflow:auto; margin: 6px 0; }
+          .destpicker .dest-actions { text-align:right; padding-top:6px; border-top:1px solid #2a2a2a; }
           .dest-row { display:flex; align-items:center; padding:4px; cursor:pointer; border-radius:3px; }
           .dest-row:hover { background:#2a2a2a; }
           .dest-row input { margin-right:6px; }
@@ -712,7 +725,7 @@
         <div class="panel collapsed" id="panel">
           <div class="badge" id="badge">P</div>
           <div class="header">
-            <div class="title">Playlist Manager</div>
+            <div class="title">Playlist Manager <span class="acct" id="acct" title="Active account"></span></div>
             <span class="count" id="count">0</span>
             <button class="icon" id="collapse" title="Collapse">—</button>
           </div>
@@ -730,7 +743,7 @@
           <div class="log" id="log"></div>
           <div class="hint">alpha v0.1 · undo: right-click panel header</div>
         </div>
-      `;
+      `);
 
       const $ = (id) => this._shadow.getElementById(id);
       this._el = {
@@ -738,7 +751,10 @@
         collapse: $('collapse'), selall: $('selall'), clear: $('clear'),
         copy: $('copy'), move: $('move'), export: $('export'),
         importfile: $('importfile'), destpicker: $('destpicker'), log: $('log'),
+        acct: $('acct'),
       };
+      this._refreshAcct();
+      this._updateVisibility();
 
       this._el.badge.addEventListener('click', () => this._toggleExpand());
       this._el.collapse.addEventListener('click', () => this._toggleExpand());
@@ -760,12 +776,29 @@
       }
     },
 
+    _refreshAcct() {
+      if (!this._el.acct) return;
+      const idx = auth.ytcfgGet('SESSION_INDEX') || 0;
+      const brand = auth.ytcfgGet('DELEGATED_SESSION_ID');
+      const label = brand
+        ? `brand ${String(brand).slice(0, 6)}…`
+        : `authuser ${idx}`;
+      this._el.acct.textContent = `· ${label}`;
+    },
+
+    _updateVisibility() {
+      if (!this._root) return;
+      const show = dom.isPlaylistPage();
+      this._root.style.display = show ? '' : 'none';
+    },
+
     async _loadOwnedPlaylists() {
-      if (this._ownedPlaylists.length) return;
-      this._logMsg('Loading your playlists…');
+      const tag = auth.identityTag();
+      if (this._ownedPlaylists.length && this._ownedPlaylistsTag === tag) return;
       try {
         this._ownedPlaylists = await reader.loadOwnedPlaylists();
-        this._logMsg(`Found ${this._ownedPlaylists.length} playlists`, 'ok');
+        this._ownedPlaylistsTag = tag;
+        this._logMsg(`Loaded ${this._ownedPlaylists.length} of your playlists`, 'ok');
       } catch (e) {
         this._logMsg(`Failed to load playlists: ${e.message}`, 'err');
       }
@@ -786,19 +819,21 @@
         this._logMsg('No other playlists found — reload and try again', 'warn');
         return;
       }
-      this._el.destpicker.innerHTML = `
-        <div style="font-weight:600;margin-bottom:6px;">${mode === 'move' ? 'Move' : 'Copy'} ${sel.size} videos to:</div>
-        ${candidates.map(p => `
-          <label class="dest-row">
-            <input type="checkbox" value="${escapeHtml(p.id)}">
-            <span class="dest-title">${escapeHtml(p.title)}</span>
-          </label>
-        `).join('')}
-        <div style="margin-top:8px;text-align:right;">
+      setHTML(this._el.destpicker, `
+        <div style="font-weight:600;">${mode === 'move' ? 'Move' : 'Copy'} ${sel.size} videos to:</div>
+        <div class="dest-list">
+          ${candidates.map(p => `
+            <label class="dest-row">
+              <input type="checkbox" value="${escapeHtml(p.id)}">
+              <span class="dest-title">${escapeHtml(p.title)}</span>
+            </label>
+          `).join('')}
+        </div>
+        <div class="dest-actions">
           <button class="btn" id="cancelpick">Cancel</button>
           <button class="btn primary" id="confirmpick">Go</button>
         </div>
-      `;
+      `);
       this._el.destpicker.style.display = 'block';
       this._shadow.getElementById('cancelpick').onclick = () => {
         this._el.destpicker.style.display = 'none';
@@ -884,12 +919,38 @@
       if (!file) return;
       const id = dom.currentPlaylistId();
       if (!id) { this._logMsg('Open a target playlist first', 'warn'); return; }
-      this._logMsg(`Importing ${file.name} into current playlist…`);
       try {
         const bundle = await portability.readFile(file);
         if (bundle.schema !== 'ytpm.bundle/1') {
           this._logMsg(`Unknown schema: ${bundle.schema}`, 'warn');
         }
+
+        // Preview: read the target and count how many items will actually
+        // land (after dedupe + deleted-item filtering). Confirm before write.
+        this._logMsg(`Previewing target playlist…`);
+        const { header, items } = await reader.loadPlaylist(id);
+        const existing = new Set(items.map(i => i.videoId));
+        let candidate = 0, skipDup = 0, skipDel = 0;
+        for (const p of bundle.playlists || []) {
+          for (const it of p.items || []) {
+            if (it.deleted) { skipDel++; continue; }
+            if (existing.has(it.videoId)) { skipDup++; continue; }
+            candidate++;
+          }
+        }
+        const title = header.title || id;
+        if (candidate === 0) {
+          this._logMsg(`Nothing to import (${skipDup} dupes, ${skipDel} removed from YT)`, 'warn');
+          return;
+        }
+        const msg =
+          `Add ${candidate} new video${candidate === 1 ? '' : 's'} to "${title}"?\n` +
+          (skipDup || skipDel
+            ? `(${skipDup} already in playlist, ${skipDel} no longer on YouTube — will be skipped)`
+            : '');
+        if (!confirm(msg)) { this._logMsg('Import cancelled', 'warn'); return; }
+
+        this._logMsg(`Importing ${candidate} into "${title}"…`);
         const r = await portability.importIntoPlaylist(id, bundle, { dedupe: true });
         this._logMsg(`Imported: applied=${r.applied} failed=${r.failed.length}`, r.failed.length ? 'warn' : 'ok');
       } catch (e) {
@@ -905,17 +966,34 @@
     return String(s).replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
   }
 
+  // YouTube serves `require-trusted-types-for 'script'`; raw innerHTML
+  // assignment throws. Route through a named policy so shadow/panel HTML
+  // renders under the CSP.
+  const ttPolicy = (() => {
+    try { return window.trustedTypes?.createPolicy?.('ytpm', { createHTML: s => s }) || null; }
+    catch { return null; }
+  })();
+  function setHTML(el, html) {
+    el.innerHTML = ttPolicy ? ttPolicy.createHTML(html) : html;
+  }
+
   // ─────────────────────────────────────────────────────────────────────────
   // Boot
   // ─────────────────────────────────────────────────────────────────────────
+  let _bootTries = 0;
   function boot() {
     if (!window.ytcfg) {
+      if (++_bootTries % 25 === 0) console.warn('[YTPM] still waiting for window.ytcfg (tries=' + _bootTries + '). If this never goes away, the userscript is running in an isolated sandbox — set @grant none.');
       setTimeout(boot, 200);
       return;
     }
-    ui.mount();
-    dom.start();
-    log('YTPM mounted');
+    try {
+      ui.mount();
+      dom.start();
+      console.log('[YTPM] mounted (v0.1.3)');
+    } catch (e) {
+      console.error('[YTPM] mount failed:', e);
+    }
   }
   if (document.readyState === 'complete' || document.readyState === 'interactive') boot();
   else window.addEventListener('DOMContentLoaded', boot);
