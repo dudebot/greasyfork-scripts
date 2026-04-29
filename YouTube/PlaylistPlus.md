@@ -80,7 +80,7 @@ Your cookie jar is not required to be for a single account; the script uses what
 ## Troubleshooting
 
 **No P badge appears.**
-Open DevTools (F12) and look for `[YTPM] mounted (v0.1.3)` in the console. If it's not there, the script didn't run — check that Tampermonkey is enabled and the script is enabled.
+Open DevTools (F12) and look for `[YTPM] mounted (v0.1.5)` in the console. If it's not there, the script didn't run — check that Tampermonkey is enabled and the script is enabled.
 
 **Console shows `Failed to set 'innerHTML' on 'ShadowRoot'`.**
 YouTube tightened Trusted Types CSP; file a bug with the exact error — we'll need to rework the rendering path.

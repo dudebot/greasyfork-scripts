@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PlaylistPlus
 // @namespace    https://github.com/dudebot/greasyfork-scripts
-// @version      0.1.3
+// @version      0.1.5
 // @description  Bulk copy/move videos across playlists with checkboxes. Export/import playlists as JSON. The missing YouTube power-user tool.
 // @author       dudebot
 // @match        https://www.youtube.com/*
@@ -17,7 +17,6 @@
   // Config
   // ─────────────────────────────────────────────────────────────────────────
   const CFG = {
-    STORAGE_VERSION: 1,
     BATCH_SIZE: 100,
     MAX_BATCH_RETRIES: 3,
     PACE_MU_MS: 1200,
@@ -28,62 +27,14 @@
     BACKOFF_MAX_MS: 60000,
     BACKOFF_MAX_ATTEMPTS: 3,
     WARN_BULK_THRESHOLD: 500,
+    FETCH_TIMEOUT_MS: 30000,
+    MAX_PAGES: 200, // ceiling for paginated reads — guards runaway continuations
     DEBUG: false,
   };
 
   const log = (...a) => { if (CFG.DEBUG) console.log('[YTPM]', ...a); };
   const warn = (...a) => console.warn('[YTPM]', ...a);
   const err = (...a) => console.error('[YTPM]', ...a);
-
-  // ─────────────────────────────────────────────────────────────────────────
-  // Storage (GM_setValue with localStorage fallback, account-scoped)
-  // ─────────────────────────────────────────────────────────────────────────
-  const storage = {
-    _backend: typeof GM_setValue === 'function' ? 'gm' : 'ls',
-    _idHash: null,
-
-    async _initIdHash() {
-      if (this._idHash) return this._idHash;
-      const cfg = window.ytcfg;
-      const dsid = cfg?.get?.('DELEGATED_SESSION_ID') || '';
-      const chid = cfg?.get?.('CHANNEL_ID') || '';
-      const sidx = cfg?.get?.('SESSION_INDEX') || '0';
-      const raw = dsid || `${sidx}:${chid}`;
-      if (!raw || raw === '0:') {
-        this._idHash = 'anon';
-        return this._idHash;
-      }
-      const enc = new TextEncoder().encode(raw);
-      const buf = await crypto.subtle.digest('SHA-256', enc);
-      const hex = [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
-      this._idHash = hex.slice(0, 12);
-      return this._idHash;
-    },
-
-    async _k(suffix) {
-      const h = await this._initIdHash();
-      return `ytpm:v${CFG.STORAGE_VERSION}:acct:${h}:${suffix}`;
-    },
-
-    async get(suffix, fallback = null) {
-      const k = await this._k(suffix);
-      if (this._backend === 'gm') return GM_getValue(k, fallback);
-      const v = localStorage.getItem(k);
-      return v == null ? fallback : JSON.parse(v);
-    },
-
-    async set(suffix, val) {
-      const k = await this._k(suffix);
-      if (this._backend === 'gm') return GM_setValue(k, val);
-      localStorage.setItem(k, JSON.stringify(val));
-    },
-
-    async del(suffix) {
-      const k = await this._k(suffix);
-      if (this._backend === 'gm') return GM_deleteValue(k);
-      localStorage.removeItem(k);
-    },
-  };
 
   // ─────────────────────────────────────────────────────────────────────────
   // Pacing — log-normal jittered delays, single-flight writes
@@ -184,6 +135,23 @@
     identityTag() {
       return `${this.ytcfgGet('SESSION_INDEX') || 0}|${this.ytcfgGet('DELEGATED_SESSION_ID') || ''}`;
     },
+
+    // Op-scoped identity pin. Capture at the start of a multi-step operation
+    // (move, copy, import, delete) and call check() before any destructive
+    // step. If the active account/brand changed mid-op, the guard throws and
+    // the op is aborted before later batches go to the wrong principal.
+    openOpGuard() {
+      const tag = this.identityTag();
+      return {
+        tag,
+        check: () => {
+          const now = auth.identityTag();
+          if (now !== tag) {
+            throw new Error(`Identity changed mid-operation (was "${tag}", now "${now}") — aborting to avoid wrong-account writes`);
+          }
+        },
+      };
+    },
   };
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -212,12 +180,25 @@
       let attempt = 0;
       let backoff = CFG.BACKOFF_START_MS;
       for (;;) {
-        const res = await fetch(url, {
-          method: 'POST',
-          credentials: 'include',
-          headers,
-          body: JSON.stringify(payload),
-        });
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), CFG.FETCH_TIMEOUT_MS);
+        let res;
+        try {
+          res = await fetch(url, {
+            method: 'POST',
+            credentials: 'include',
+            headers,
+            body: JSON.stringify(payload),
+            signal: ctrl.signal,
+          });
+        } catch (e) {
+          if (e.name === 'AbortError') {
+            throw new Error(`InnerTube ${endpoint} timed out after ${CFG.FETCH_TIMEOUT_MS}ms`);
+          }
+          throw e;
+        } finally {
+          clearTimeout(timer);
+        }
         if (res.status === 429 || res.status === 503) {
           attempt++;
           if (attempt > CFG.BACKOFF_MAX_ATTEMPTS) throw new Error(`Rate-limited after ${attempt} retries (${res.status})`);
@@ -272,12 +253,33 @@
       let resp = await innertube.browse({ browseId: `VL${playlistId}` });
       const header = this._extractHeader(resp);
       let renderers = this._findPlaylistRenderers(resp);
+      // Parse-drift sentinel: if the response carries playlist metadata but
+      // we recognize no item renderer path on the very first page, raise
+      // loud rather than returning an empty playlist (which would silently
+      // poison exports, dedupe previews, and setVideoId resolution).
+      if (header.title && !renderers && header.itemCount !== 0) {
+        throw new Error(`Playlist parse drift: header recognized but no item renderers found (playlistId=${playlistId})`);
+      }
+      const seenTokens = new Set();
+      let pages = 0;
       while (renderers && renderers.length) {
+        pages++;
+        if (pages > CFG.MAX_PAGES) {
+          throw new Error(`Pagination ceiling reached (${CFG.MAX_PAGES} pages, ${items.length} items) — likely a runaway continuation loop`);
+        }
         const extracted = this._extractItems(renderers);
         const cont = extracted.find(x => x.__continuation);
+        const before = items.length;
         for (const it of extracted) if (!it.__continuation) items.push(it);
         if (onProgress) onProgress({ loaded: items.length, total: header.itemCount });
         if (!cont) break;
+        if (seenTokens.has(cont.__continuation)) {
+          throw new Error(`Pagination token repeated at page ${pages} — aborting infinite loop`);
+        }
+        if (items.length === before && pages > 1) {
+          throw new Error(`Pagination made no progress (page ${pages} added 0 items)`);
+        }
+        seenTokens.add(cont.__continuation);
         resp = await innertube.browse({ continuation: cont.__continuation });
         renderers = this._findContinuationRenderers(resp);
       }
@@ -372,7 +374,7 @@
 
     async removeVideos(playlistId, setVideoIds, onProgress) {
       return this._batchedEdit(playlistId, setVideoIds.map(s => ({
-        action: 'ACTION_REMOVE_VIDEO_BY_SET_VIDEO_ID',
+        action: 'ACTION_REMOVE_VIDEO',
         setVideoId: s,
       })), { mode: 'remove', setVideoIds }, onProgress);
     },
@@ -425,11 +427,24 @@
       const countByVideo = new Map();
       for (const i of items) countByVideo.set(i.videoId, (countByVideo.get(i.videoId) || 0) + 1);
       const presentSetIds = new Set(items.map(i => i.setVideoId));
+      // Verifier health: removal logic relies on setVideoId presence in the
+      // reread. If the playlist has rows but the extractor produced zero
+      // setVideoIds, the parser has drifted — every "absent" act would look
+      // like a successful removal. Refuse to confirm.
+      if (meta.mode === 'remove' && items.length > 0) {
+        const haveSetIds = items.some(i => i.setVideoId);
+        if (!haveSetIds) {
+          throw new Error('Verifier health: playlist has rows but no setVideoIds were extracted — extractor likely drifted, refusing to confirm removals');
+        }
+      }
 
       const expectedAdds = new Map(); // videoId -> expected count after batch
       if (meta.mode === 'add') {
-        // Snapshot of expected counts: previous count (approx via current - 1 if dropped) is unknowable
-        // without pre-snapshot. Use the _preSnapshot captured before batch.
+        // Invariant: expected = pre-batch count + adds in this batch. _preCount
+        // is captured per outer batch (before any retry recursion) and shared
+        // by reference, so retries with shrunk subsets still expect the same
+        // baseline — recursive verification then sees cur >= exp once enough
+        // retries land, and short = exp - cur falls to 0.
         const pre = meta._preCount || new Map();
         for (const act of batch) {
           const v = act.addedVideoId;
@@ -499,17 +514,21 @@
     },
 
     async importIntoPlaylist(targetPlaylistId, bundle, { dedupe = true } = {}) {
-      const pls = bundle.playlists || [];
+      const pls = Array.isArray(bundle?.playlists) ? bundle.playlists : [];
       const existingIds = new Set();
       if (dedupe) {
         const { items } = await reader.loadPlaylist(targetPlaylistId);
         items.forEach(i => existingIds.add(i.videoId));
       }
+      const seenInBundle = new Set();
       const videoIds = [];
       for (const p of pls) {
-        for (const it of p.items || []) {
+        for (const it of (p?.items || [])) {
+          if (!it || typeof it.videoId !== 'string' || !it.videoId) continue;
           if (it.deleted) continue;
           if (dedupe && existingIds.has(it.videoId)) continue;
+          if (seenInBundle.has(it.videoId)) continue;
+          seenInBundle.add(it.videoId);
           videoIds.push(it.videoId);
         }
       }
@@ -537,8 +556,12 @@
   // ─────────────────────────────────────────────────────────────────────────
   const dom = {
     _observer: null,
-    _selected: new Map(), // videoId -> { setVideoId, title }
+    // rowKey -> { videoId, setVideoId, title }
+    // Keyed per-row (not per-videoId) so that playlists with the same video
+    // appearing more than once track each instance independently.
+    _selected: new Map(),
     _listeners: new Set(),
+    _rowSeq: 0,
 
     currentPlaylistId() {
       const u = new URL(location.href);
@@ -563,9 +586,9 @@
     _refreshCheckboxes() {
       const rows = document.querySelectorAll('ytd-playlist-video-renderer');
       rows.forEach(r => {
-        const vid = this._videoIdOf(r);
+        const rowKey = r.dataset.ytpmRowKey;
         const cb = r.querySelector('.ytpm-cb');
-        if (cb) cb.checked = this._selected.has(vid);
+        if (cb && rowKey) cb.checked = this._selected.has(rowKey);
       });
     },
 
@@ -592,21 +615,26 @@
       const rows = document.querySelectorAll('ytd-playlist-video-renderer');
       rows.forEach(row => {
         if (row.querySelector('.ytpm-cb')) return;
+        if (!row.dataset.ytpmRowKey) {
+          row.dataset.ytpmRowKey = `r${++this._rowSeq}`;
+        }
         const cb = document.createElement('input');
         cb.type = 'checkbox';
         cb.className = 'ytpm-cb';
         cb.style.cssText = 'margin-right: 8px; width: 18px; height: 18px; cursor: pointer; accent-color: #f00;';
         cb.addEventListener('click', (e) => {
           e.stopPropagation();
+          const rowKey = row.dataset.ytpmRowKey;
           const vid = this._videoIdOf(row);
-          if (!vid) return;
+          if (!rowKey || !vid) return;
           if (cb.checked) {
-            this._selected.set(vid, {
+            this._selected.set(rowKey, {
+              videoId: vid,
               setVideoId: this._setVideoIdOf(row),
               title: this._titleOf(row),
             });
           } else {
-            this._selected.delete(vid);
+            this._selected.delete(rowKey);
           }
           this._emit();
         });
@@ -619,8 +647,13 @@
     selectAll() {
       const rows = document.querySelectorAll('ytd-playlist-video-renderer');
       rows.forEach(row => {
+        if (!row.dataset.ytpmRowKey) {
+          row.dataset.ytpmRowKey = `r${++this._rowSeq}`;
+        }
+        const rowKey = row.dataset.ytpmRowKey;
         const vid = this._videoIdOf(row);
-        if (vid) this._selected.set(vid, {
+        if (rowKey && vid) this._selected.set(rowKey, {
+          videoId: vid,
           setVideoId: this._setVideoIdOf(row),
           title: this._titleOf(row),
         });
@@ -656,6 +689,7 @@
     _ownedPlaylists: [],
     _ownedPlaylistsTag: null,
     _log: [],
+    _busy: false,
 
     _logMsg(msg, kind = 'info') {
       this._log.push({ t: Date.now(), msg, kind });
@@ -705,6 +739,9 @@
           button.btn.primary { background:#c00; color:#fff; }
           button.btn.primary:hover { background:#e00; }
           button.btn:disabled { opacity:.5; cursor:not-allowed; }
+          button.btn.danger { background:#5a1a1a; color:#fff; }
+          button.btn.danger:hover { background:#7a2020; }
+          .span2 { grid-column: 1 / -1; }
           .destpicker { padding: 4px 12px; display:flex; flex-direction:column; }
           .destpicker .dest-list { max-height: 180px; overflow:auto; margin: 6px 0; }
           .destpicker .dest-actions { text-align:right; padding-top:6px; border-top:1px solid #2a2a2a; }
@@ -735,13 +772,14 @@
             <button class="btn" id="clear">Clear</button>
             <button class="btn primary" id="copy">Copy to…</button>
             <button class="btn primary" id="move">Move to…</button>
+            <button class="btn danger span2" id="delete">Delete from this playlist</button>
             <button class="btn" id="export">Export JSON</button>
             <label class="btn" style="text-align:center;cursor:pointer;" for="importfile">Import JSON</label>
             <input type="file" id="importfile" accept=".json,application/json">
           </div>
           <div class="destpicker" id="destpicker" style="display:none"></div>
           <div class="log" id="log"></div>
-          <div class="hint">alpha v0.1 · undo: right-click panel header</div>
+          <div class="hint">alpha v0.1.5</div>
         </div>
       `);
 
@@ -749,7 +787,7 @@
       this._el = {
         panel: $('panel'), badge: $('badge'), count: $('count'), bar: $('bar'),
         collapse: $('collapse'), selall: $('selall'), clear: $('clear'),
-        copy: $('copy'), move: $('move'), export: $('export'),
+        copy: $('copy'), move: $('move'), delete: $('delete'), export: $('export'),
         importfile: $('importfile'), destpicker: $('destpicker'), log: $('log'),
         acct: $('acct'),
       };
@@ -760,13 +798,44 @@
       this._el.collapse.addEventListener('click', () => this._toggleExpand());
       this._el.selall.addEventListener('click', () => dom.selectAll());
       this._el.clear.addEventListener('click', () => dom.clearSelection());
-      this._el.copy.addEventListener('click', () => this._showDestPicker('copy'));
-      this._el.move.addEventListener('click', () => this._showDestPicker('move'));
-      this._el.export.addEventListener('click', () => this._doExport());
-      this._el.importfile.addEventListener('change', (e) => this._doImport(e.target.files[0]));
+      this._el.copy.addEventListener('click', () => this._withLock(() => this._showDestPicker('copy')));
+      this._el.move.addEventListener('click', () => this._withLock(() => this._showDestPicker('move')));
+      this._el.delete.addEventListener('click', () => this._withLock(() => this._doDelete()));
+      this._el.export.addEventListener('click', () => this._withLock(() => this._doExport()));
+      this._el.importfile.addEventListener('change', (e) => {
+        const file = e.target.files[0];
+        // Reset so the same file can be re-imported after a previous attempt
+        e.target.value = '';
+        this._withLock(() => this._doImport(file));
+      });
 
       dom.onSelectionChange(sel => this._onSelectionChange(sel));
       this._renderLog();
+    },
+
+    // UI in-flight lock — prevents overlapping write operations from
+    // double-click, accidental re-trigger, or queuing two bulk ops at once.
+    // pacing.serialize() only serializes individual write batches; this
+    // makes whole user-initiated workflows atomic.
+    async _withLock(fn) {
+      if (this._busy) {
+        this._logMsg('Another operation is in progress — wait for it to finish.', 'warn');
+        return;
+      }
+      this._busy = true;
+      this._setActionsDisabled(true);
+      try {
+        return await fn();
+      } finally {
+        this._busy = false;
+        this._setActionsDisabled(false);
+      }
+    },
+
+    _setActionsDisabled(disabled) {
+      for (const k of ['selall','clear','copy','move','delete','export']) {
+        if (this._el[k]) this._el[k].disabled = disabled;
+      }
     },
 
     _toggleExpand() {
@@ -815,85 +884,222 @@
       if (!sel.size) { this._logMsg('No videos selected', 'warn'); return; }
       const srcId = dom.currentPlaylistId();
       const candidates = this._ownedPlaylists.filter(p => p.id !== srcId);
-      if (!candidates.length) {
-        this._logMsg('No other playlists found — reload and try again', 'warn');
-        return;
-      }
-      setHTML(this._el.destpicker, `
-        <div style="font-weight:600;">${mode === 'move' ? 'Move' : 'Copy'} ${sel.size} videos to:</div>
-        <div class="dest-list">
-          ${candidates.map(p => `
-            <label class="dest-row">
-              <input type="checkbox" value="${escapeHtml(p.id)}">
-              <span class="dest-title">${escapeHtml(p.title)}</span>
+      return new Promise((resolve) => {
+        setHTML(this._el.destpicker, `
+          <div style="font-weight:600;">${mode === 'move' ? 'Move' : 'Copy'} ${sel.size} videos to:</div>
+          <div class="dest-list">
+            <label class="dest-row" style="border-bottom:1px solid #2a2a2a;font-style:italic;">
+              <input type="checkbox" value="__NEW__">
+              <span class="dest-title">+ Create new playlist…</span>
             </label>
-          `).join('')}
-        </div>
-        <div class="dest-actions">
-          <button class="btn" id="cancelpick">Cancel</button>
-          <button class="btn primary" id="confirmpick">Go</button>
-        </div>
-      `);
-      this._el.destpicker.style.display = 'block';
-      this._shadow.getElementById('cancelpick').onclick = () => {
-        this._el.destpicker.style.display = 'none';
-      };
-      this._shadow.getElementById('confirmpick').onclick = async () => {
-        const picks = [...this._shadow.querySelectorAll('.dest-row input:checked')].map(i => i.value);
-        if (!picks.length) { this._logMsg('Pick at least one destination', 'warn'); return; }
-        this._el.destpicker.style.display = 'none';
-        await this._runBulkOp(mode, picks, sel);
-      };
+            ${candidates.map(p => `
+              <label class="dest-row">
+                <input type="checkbox" value="${escapeHtml(p.id)}">
+                <span class="dest-title">${escapeHtml(p.title)}</span>
+              </label>
+            `).join('')}
+          </div>
+          <div class="dest-actions">
+            <button class="btn" id="cancelpick">Cancel</button>
+            <button class="btn primary" id="confirmpick">Go</button>
+          </div>
+        `);
+        this._el.destpicker.style.display = 'block';
+        this._shadow.getElementById('cancelpick').onclick = () => {
+          this._el.destpicker.style.display = 'none';
+          resolve();
+        };
+        this._shadow.getElementById('confirmpick').onclick = async () => {
+          const picks = [...this._shadow.querySelectorAll('.dest-row input:checked')].map(i => i.value);
+          if (!picks.length) { this._logMsg('Pick at least one destination', 'warn'); return; }
+          this._el.destpicker.style.display = 'none';
+          try { await this._runBulkOp(mode, picks, sel); }
+          finally { resolve(); }
+        };
+      });
+    },
+
+    // Resolve a setVideoId per selected row, preserving duplicates.
+    // If a row already has its setVideoId from DOM scraping, use it.
+    // Otherwise, consume one entry from a per-videoId queue built off the
+    // source playlist read so multiple selected instances of the same video
+    // map to distinct setVideoIds rather than collapsing to a single one.
+    async _resolveSetVideoIds(srcId, sel) {
+      const need = [...sel.values()];
+      const direct = need.map(v => v.setVideoId).filter(Boolean);
+      if (direct.length === sel.size) return direct;
+      const { items } = await reader.loadPlaylist(srcId);
+      const queueByVid = new Map();
+      for (const it of items) {
+        if (!it.setVideoId) continue;
+        if (!queueByVid.has(it.videoId)) queueByVid.set(it.videoId, []);
+        queueByVid.get(it.videoId).push(it.setVideoId);
+      }
+      // Pre-consume DOM-scraped setVideoIds so they aren't double-allocated
+      // from the queue.
+      for (const v of need) {
+        if (!v.setVideoId) continue;
+        const q = queueByVid.get(v.videoId);
+        if (q) {
+          const idx = q.indexOf(v.setVideoId);
+          if (idx >= 0) q.splice(idx, 1);
+        }
+      }
+      const out = [];
+      for (const v of need) {
+        if (v.setVideoId) { out.push(v.setVideoId); continue; }
+        const q = queueByVid.get(v.videoId);
+        if (q && q.length) out.push(q.shift());
+      }
+      return out;
     },
 
     async _runBulkOp(mode, destIds, sel) {
       const srcId = dom.currentPlaylistId();
-      const videoIds = [...sel.keys()];
-      let setVideoIds = [...sel.values()].map(v => v.setVideoId).filter(Boolean);
+      const videoIds = [...sel.values()].map(v => v.videoId);
+      const guard = auth.openOpGuard();
 
-      // For move, resolve setVideoIds reliably via InnerTube if DOM scraping came up short
-      if (mode === 'move' && setVideoIds.length !== sel.size) {
+      const realDestIds = destIds.filter(id => id !== '__NEW__');
+      if (destIds.includes('__NEW__')) {
+        const name = prompt('Name for the new playlist:');
+        if (!name || !name.trim()) {
+          this._logMsg('New-playlist destination cancelled (no name)', 'warn');
+          return;
+        }
+        try {
+          guard.check();
+          const newId = await this._createNewPlaylist(name.trim(), videoIds);
+          if (!newId) return;
+          // Created playlists already have the videos added by playlistCreate;
+          // skip them from the destination loop below to avoid double-add.
+          this._ownedPlaylists.push({ id: newId, title: name.trim() });
+          this._logMsg(`Created playlist "${name.trim()}" (${newId}) and seeded with ${videoIds.length} videos`, 'ok');
+        } catch (e) {
+          this._logMsg(`Create-new-playlist failed: ${e.message}. Aborting.`, 'err');
+          return;
+        }
+      }
+
+      let setVideoIds = [];
+      if (mode === 'move') {
         this._logMsg(`Resolving setVideoIds from source playlist…`);
         try {
-          const { items } = await reader.loadPlaylist(srcId);
-          const byVid = new Map();
-          for (const it of items) if (it.setVideoId) byVid.set(it.videoId, it.setVideoId);
-          setVideoIds = videoIds.map(v => byVid.get(v)).filter(Boolean);
+          setVideoIds = await this._resolveSetVideoIds(srcId, sel);
           if (setVideoIds.length !== sel.size) {
-            this._logMsg(`Warning: only resolved ${setVideoIds.length}/${sel.size} setVideoIds; proceeding with what we have`, 'warn');
+            this._logMsg(`Warning: resolved ${setVideoIds.length}/${sel.size} setVideoIds; will proceed but some rows may not be removable`, 'warn');
           }
         } catch (e) {
           this._logMsg(`Failed to resolve setVideoIds: ${e.message}. Aborting move.`, 'err');
           return;
         }
       }
+
       if (sel.size > CFG.WARN_BULK_THRESHOLD) {
-        if (!confirm(`You're about to ${mode} ${sel.size} videos across ${destIds.length} playlists. Continue?`)) return;
+        if (!confirm(`You're about to ${mode} ${sel.size} videos across ${realDestIds.length + (destIds.includes('__NEW__') ? 1 : 0)} playlists. Continue?`)) return;
       }
 
-      this._logMsg(`${mode === 'move' ? 'Moving' : 'Copying'} ${videoIds.length} videos → ${destIds.length} playlists…`);
-      try {
-        for (const destId of destIds) {
+      const destFailures = []; // { destId, failed?, error? }
+      if (realDestIds.length) {
+        this._logMsg(`${mode === 'move' ? 'Moving' : 'Copying'} ${videoIds.length} videos → ${realDestIds.length} existing playlist${realDestIds.length === 1 ? '' : 's'}…`);
+      }
+      for (const destId of realDestIds) {
+        try {
+          guard.check();
           this._logMsg(`  → ${destId}`);
           const r = await mutator.addVideos(destId, videoIds, p => {
             this._setProgress(p.applied / videoIds.length);
             this._el.count.textContent = `${p.applied}/${videoIds.length}`;
           });
+          if (r.failed.length > 0) destFailures.push({ destId, failed: r.failed.length });
           this._logMsg(`  + added ${r.applied}, retried ${r.retried}, failed ${r.failed.length}`, r.failed.length ? 'warn' : 'ok');
+        } catch (e) {
+          destFailures.push({ destId, error: e.message });
+          this._logMsg(`  ! ${destId}: ${e.message}`, 'err');
         }
-        if (mode === 'move') {
+      }
+
+      if (mode === 'move') {
+        if (destFailures.length > 0) {
+          // Move = copy-then-conditional-delete. Any destination failure
+          // means the source playlist must be left intact, otherwise we
+          // silently lose data on a partial copy.
+          this._logMsg(`Aborting source removal: ${destFailures.length}/${realDestIds.length} destinations had failures. Source playlist left intact.`, 'err');
+          this._setProgress(0);
+          return;
+        }
+        try {
+          guard.check();
           this._logMsg(`Removing ${setVideoIds.length} from source…`);
           const r = await mutator.removeVideos(srcId, setVideoIds, p => {
             this._setProgress(p.applied / setVideoIds.length);
           });
           this._logMsg(`- removed ${r.applied}, failed ${r.failed.length}`, r.failed.length ? 'warn' : 'ok');
+        } catch (e) {
+          this._logMsg(`Source removal error: ${e.message}`, 'err');
         }
+      }
+      dom.clearSelection();
+      this._setProgress(0);
+      this._logMsg(`Done.`, 'ok');
+    },
+
+    // Seed via playlistCreate's `videoIds` argument so we skip the per-batch
+    // verifier path that addVideos uses.
+    async _createNewPlaylist(title, videoIds) {
+      const body = {
+        title,
+        privacyStatus: 'PRIVATE',
+      };
+      if (videoIds && videoIds.length) body.videoIds = videoIds;
+      const resp = await innertube.playlistCreate(body);
+      // Multiple known response shapes — try them in order.
+      const newId = resp?.playlistId
+                 || resp?.actions?.[0]?.createPlaylistAction?.playlistId
+                 || resp?.actions?.find?.(a => a?.createPlaylistAction)?.createPlaylistAction?.playlistId;
+      if (!newId) {
+        throw new Error('playlistCreate returned no recognizable playlist ID — InnerTube response shape may have drifted');
+      }
+      return newId;
+    },
+
+    async _doDelete() {
+      const sel = dom.getSelection();
+      if (!sel.size) { this._logMsg('No videos selected', 'warn'); return; }
+      const srcId = dom.currentPlaylistId();
+      if (!srcId) { this._logMsg('Not on a playlist page', 'warn'); return; }
+
+      const guard = auth.openOpGuard();
+      let setVideoIds;
+      try {
+        setVideoIds = await this._resolveSetVideoIds(srcId, sel);
+      } catch (e) {
+        this._logMsg(`Failed to resolve setVideoIds: ${e.message}. Aborting delete.`, 'err');
+        return;
+      }
+      if (!setVideoIds.length) {
+        this._logMsg('Could not resolve any setVideoIds for the selected rows; cannot delete.', 'err');
+        return;
+      }
+      if (setVideoIds.length !== sel.size) {
+        this._logMsg(`Warning: resolved ${setVideoIds.length}/${sel.size} setVideoIds; only those will be deleted`, 'warn');
+      }
+
+      if (!confirm(`Delete ${setVideoIds.length} video${setVideoIds.length === 1 ? '' : 's'} from this playlist?\nThis cannot be undone.`)) {
+        this._logMsg('Delete cancelled', 'warn');
+        return;
+      }
+
+      this._logMsg(`Deleting ${setVideoIds.length} from current playlist…`);
+      try {
+        guard.check();
+        const r = await mutator.removeVideos(srcId, setVideoIds, p => {
+          this._setProgress(p.applied / setVideoIds.length);
+        });
+        this._logMsg(`- deleted ${r.applied}, failed ${r.failed.length}`, r.failed.length ? 'warn' : 'ok');
         dom.clearSelection();
         this._setProgress(0);
-        this._logMsg(`Done.`, 'ok');
       } catch (e) {
-        err(e);
-        this._logMsg(`Error: ${e.message}`, 'err');
+        this._logMsg(`Delete error: ${e.message}`, 'err');
       }
     },
 
@@ -919,37 +1125,61 @@
       if (!file) return;
       const id = dom.currentPlaylistId();
       if (!id) { this._logMsg('Open a target playlist first', 'warn'); return; }
+      const guard = auth.openOpGuard();
       try {
         const bundle = await portability.readFile(file);
+        if (!bundle || typeof bundle !== 'object') {
+          this._logMsg('Import failed: file is not a valid JSON object', 'err');
+          return;
+        }
+        if (!Array.isArray(bundle.playlists)) {
+          this._logMsg('Import failed: bundle.playlists missing or not an array', 'err');
+          return;
+        }
         if (bundle.schema !== 'ytpm.bundle/1') {
           this._logMsg(`Unknown schema: ${bundle.schema}`, 'warn');
         }
+        const sources = bundle.playlists.length;
+        if (sources > 1) {
+          this._logMsg(`Bundle contains ${sources} source playlists — all will be merged into the current target.`, 'warn');
+        }
 
         // Preview: read the target and count how many items will actually
-        // land (after dedupe + deleted-item filtering). Confirm before write.
+        // land (after dedupe across target + within-bundle + deleted-item
+        // filter + per-item videoId validation). Confirm before write.
         this._logMsg(`Previewing target playlist…`);
         const { header, items } = await reader.loadPlaylist(id);
         const existing = new Set(items.map(i => i.videoId));
-        let candidate = 0, skipDup = 0, skipDel = 0;
-        for (const p of bundle.playlists || []) {
-          for (const it of p.items || []) {
+        const accepted = new Set();
+        let candidate = 0, skipDup = 0, skipDel = 0, skipInBundle = 0, skipBad = 0;
+        for (const p of bundle.playlists) {
+          for (const it of (p?.items || [])) {
+            if (!it || typeof it.videoId !== 'string' || !it.videoId) { skipBad++; continue; }
             if (it.deleted) { skipDel++; continue; }
             if (existing.has(it.videoId)) { skipDup++; continue; }
+            if (accepted.has(it.videoId)) { skipInBundle++; continue; }
+            accepted.add(it.videoId);
             candidate++;
           }
         }
         const title = header.title || id;
         if (candidate === 0) {
-          this._logMsg(`Nothing to import (${skipDup} dupes, ${skipDel} removed from YT)`, 'warn');
+          this._logMsg(`Nothing to import (${skipDup} dupes in target, ${skipInBundle} dup within bundle, ${skipDel} removed from YT, ${skipBad} malformed)`, 'warn');
           return;
         }
+        const sourceLine = sources > 1 ? `Merging ${sources} source playlists.\n` : '';
+        const skipBits = [];
+        if (skipDup) skipBits.push(`${skipDup} already in playlist`);
+        if (skipInBundle) skipBits.push(`${skipInBundle} dup within bundle`);
+        if (skipDel) skipBits.push(`${skipDel} no longer on YouTube`);
+        if (skipBad) skipBits.push(`${skipBad} malformed`);
         const msg =
+          sourceLine +
           `Add ${candidate} new video${candidate === 1 ? '' : 's'} to "${title}"?\n` +
-          (skipDup || skipDel
-            ? `(${skipDup} already in playlist, ${skipDel} no longer on YouTube — will be skipped)`
-            : '');
+          (skipBits.length ? `(${skipBits.join(', ')} — will be skipped)` : '');
         if (!confirm(msg)) { this._logMsg('Import cancelled', 'warn'); return; }
 
+        guard.check();
         this._logMsg(`Importing ${candidate} into "${title}"…`);
         const r = await portability.importIntoPlaylist(id, bundle, { dedupe: true });
         this._logMsg(`Imported: applied=${r.applied} failed=${r.failed.length}`, r.failed.length ? 'warn' : 'ok');
@@ -990,7 +1220,7 @@
     try {
       ui.mount();
       dom.start();
-      console.log('[YTPM] mounted (v0.1.3)');
+      console.log('[YTPM] mounted (v0.1.5)');
     } catch (e) {
       console.error('[YTPM] mount failed:', e);
     }
