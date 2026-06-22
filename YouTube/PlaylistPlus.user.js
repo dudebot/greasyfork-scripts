@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PlaylistPlus
 // @namespace    https://github.com/dudebot/greasyfork-scripts
-// @version      0.1.6
+// @version      0.1.7
 // @description  Bulk copy/move videos across playlists with checkboxes. Export/import playlists as JSON. The missing YouTube power-user tool.
 // @author       dudebot
 // @match        https://www.youtube.com/*
@@ -115,6 +115,32 @@
 
     ytcfgGet(key) {
       return window.ytcfg?.get?.(key);
+    },
+
+    // Human-readable label for the active account/brand. authuser/brand indices
+    // are meaningless to users and acting on the wrong account is destructive, so
+    // resolve the real name via account/account_menu (cached per identity).
+    _acctName: null, _acctHandle: null, _acctTag: null,
+    async accountLabel() {
+      const tag = this.identityTag();
+      if (this._acctName && this._acctTag === tag) return this._acctName;
+      let name = null, handle = null;
+      try {
+        const j = await innertube.call('account/account_menu', {});
+        (function walk(n) {
+          if (!n || typeof n !== 'object' || name) return;
+          if (Array.isArray(n)) { n.forEach(walk); return; }
+          const a = n.activeAccountHeaderRenderer;
+          if (a) {
+            name = a.accountName?.simpleText || a.accountName?.runs?.[0]?.text || null;
+            handle = a.channelHandle?.simpleText || a.channelHandle?.runs?.[0]?.text || a.email?.simpleText || null;
+            return;
+          }
+          for (const k in n) walk(n[k]);
+        })(j);
+      } catch (e) { /* caller keeps its fallback label */ }
+      if (name) { this._acctName = name; this._acctHandle = handle; this._acctTag = tag; }
+      return name;
     },
 
     context() {
@@ -759,6 +785,7 @@
           .dest-row:hover { background:#2a2a2a; }
           .dest-row input { margin-right:6px; }
           .dest-row .dest-title { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+          .dest-manual { width:100%; box-sizing:border-box; margin:4px 0; padding:6px; background:#303030; border:1px solid #3a3a3a; color:#eee; border-radius:4px; font-size:11px; }
           .log { flex:1; max-height:120px; overflow:auto; padding: 6px 12px; font-size:11px; color:#aaa; border-top:1px solid #2a2a2a; }
           .log-info { color:#aaa; }
           .log-ok { color:#7e7; }
@@ -773,7 +800,7 @@
           <div class="badge" id="badge">P</div>
           <div class="header">
             <div class="title">Playlist Manager <span class="acct" id="acct" title="Active account"></span></div>
-            <span class="count" id="count">0</span>
+            <span class="count" id="count"></span>
             <button class="icon" id="collapse" title="Collapse">—</button>
           </div>
           <div class="progress"><div class="bar" id="bar"></div></div>
@@ -789,7 +816,7 @@
           </div>
           <div class="destpicker" id="destpicker" style="display:none"></div>
           <div class="log" id="log"></div>
-          <div class="hint">alpha v0.1.6</div>
+          <div class="hint">alpha v0.1.7</div>
         </div>
       `);
 
@@ -859,10 +886,14 @@
       if (!this._el.acct) return;
       const idx = auth.ytcfgGet('SESSION_INDEX') || 0;
       const brand = auth.ytcfgGet('DELEGATED_SESSION_ID');
-      const label = brand
-        ? `brand ${String(brand).slice(0, 6)}…`
-        : `authuser ${idx}`;
-      this._el.acct.textContent = `· ${label}`;
+      // Immediate fallback; replaced async with the real account name once fetched.
+      this._el.acct.textContent = `· ${brand ? `brand ${String(brand).slice(0, 6)}…` : `account ${idx}`}`;
+      auth.accountLabel().then(name => {
+        if (name && this._el.acct) {
+          this._el.acct.textContent = `· ${name}`;
+          this._el.acct.title = auth._acctHandle || 'Active account';
+        }
+      }).catch(() => {});
     },
 
     _updateVisibility() {
@@ -884,7 +915,7 @@
     },
 
     _onSelectionChange(sel) {
-      this._el.count.textContent = sel.size;
+      this._el.count.textContent = sel.size ? `${sel.size} selected` : '';
       this._el.badge.textContent = sel.size || 'P';
       this._el.badge.style.color = sel.size ? '#fff' : '#f00';
     },
@@ -895,38 +926,66 @@
       const srcId = dom.currentPlaylistId();
       const candidates = this._ownedPlaylists.filter(p => p.id !== srcId);
       return new Promise((resolve) => {
-        setHTML(this._el.destpicker, `
-          <div style="font-weight:600;">${mode === 'move' ? 'Move' : 'Copy'} ${sel.size} videos to:</div>
-          <div class="dest-list">
-            <label class="dest-row" style="border-bottom:1px solid #2a2a2a;font-style:italic;">
-              <input type="checkbox" value="__NEW__">
-              <span class="dest-title">+ Create new playlist…</span>
-            </label>
-            ${candidates.map(p => `
-              <label class="dest-row">
-                <input type="checkbox" value="${escapeHtml(p.id)}">
-                <span class="dest-title">${escapeHtml(p.title)}</span>
+        const render = () => {
+          const candidates = this._ownedPlaylists.filter(p => p.id !== srcId);
+          setHTML(this._el.destpicker, `
+            <div style="font-weight:600;display:flex;align-items:center;gap:6px;">
+              <span style="flex:1;">${mode === 'move' ? 'Move' : 'Copy'} ${sel.size} videos to:</span>
+              <button class="icon" id="refreshpls" title="Reload your playlists">↻</button>
+            </div>
+            <div class="dest-list">
+              <label class="dest-row" style="border-bottom:1px solid #2a2a2a;font-style:italic;">
+                <input type="checkbox" value="__NEW__">
+                <span class="dest-title">+ Create new playlist…</span>
               </label>
-            `).join('')}
-          </div>
-          <div class="dest-actions">
-            <button class="btn" id="cancelpick">Cancel</button>
-            <button class="btn primary" id="confirmpick">Go</button>
-          </div>
-        `);
+              ${candidates.map(p => `
+                <label class="dest-row">
+                  <input type="checkbox" value="${escapeHtml(p.id)}">
+                  <span class="dest-title">${escapeHtml(p.title)}</span>
+                </label>
+              `).join('')}
+            </div>
+            <input id="destmanual" placeholder="…or paste a playlist URL / ID" class="dest-manual">
+            <div class="dest-actions">
+              <button class="btn" id="cancelpick">Cancel</button>
+              <button class="btn primary" id="confirmpick">Go</button>
+            </div>
+          `);
+          // A freshly-created playlist can lag in YouTube's library feed; let the
+          // user force a reload or paste the playlist URL/ID directly.
+          this._shadow.getElementById('refreshpls').onclick = async () => {
+            this._ownedPlaylistsTag = null;
+            await this._loadOwnedPlaylists();
+            render();
+          };
+          this._shadow.getElementById('cancelpick').onclick = () => {
+            this._el.destpicker.style.display = 'none';
+            resolve();
+          };
+          this._shadow.getElementById('confirmpick').onclick = async () => {
+            const picks = [...this._shadow.querySelectorAll('.dest-row input:checked')].map(i => i.value);
+            const manual = this._shadow.getElementById('destmanual')?.value?.trim();
+            if (manual) {
+              const id = this._parsePlaylistId(manual);
+              if (!id) { this._logMsg('Could not read a playlist ID from that input', 'warn'); return; }
+              if (!picks.includes(id)) picks.push(id);
+            }
+            if (!picks.length) { this._logMsg('Pick at least one destination', 'warn'); return; }
+            this._el.destpicker.style.display = 'none';
+            try { await this._runBulkOp(mode, picks, sel); }
+            finally { resolve(); }
+          };
+        };
+        render();
         this._el.destpicker.style.display = 'block';
-        this._shadow.getElementById('cancelpick').onclick = () => {
-          this._el.destpicker.style.display = 'none';
-          resolve();
-        };
-        this._shadow.getElementById('confirmpick').onclick = async () => {
-          const picks = [...this._shadow.querySelectorAll('.dest-row input:checked')].map(i => i.value);
-          if (!picks.length) { this._logMsg('Pick at least one destination', 'warn'); return; }
-          this._el.destpicker.style.display = 'none';
-          try { await this._runBulkOp(mode, picks, sel); }
-          finally { resolve(); }
-        };
       });
+    },
+
+    // Accept a raw playlist ID or any YouTube URL carrying ?list=.
+    _parsePlaylistId(s) {
+      try { const l = new URL(s).searchParams.get('list'); if (l) return l; } catch (e) {}
+      const m = String(s).match(/[A-Za-z0-9_-]{13,}/);
+      return m ? m[0] : null;
     },
 
     // Resolve a setVideoId per selected row, preserving duplicates.
@@ -1230,7 +1289,7 @@
     try {
       ui.mount();
       dom.start();
-      console.log('[YTPM] mounted (v0.1.6)');
+      console.log('[YTPM] mounted (v0.1.7)');
     } catch (e) {
       console.error('[YTPM] mount failed:', e);
     }
