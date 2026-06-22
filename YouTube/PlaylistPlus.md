@@ -101,8 +101,6 @@ Use the YouTube avatar menu to switch to the account you want, let the page relo
 
 Single file, no build step. Edit `PlaylistPlus.user.js` directly; Tampermonkey picks up changes on save (you may need to reload the YouTube tab). Sections are labeled with `──── Section Name` banner comments — grep to jump around.
 
-Tests live in `PlaylistPlus_tests/` (Playwright). Not needed for script installation, useful if you change DOM selectors or InnerTube payloads.
-
 ## License
 
 MIT. See script header.

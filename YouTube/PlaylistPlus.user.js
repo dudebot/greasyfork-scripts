@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PlaylistPlus
 // @namespace    https://github.com/dudebot/greasyfork-scripts
-// @version      0.1.5
+// @version      0.1.6
 // @description  Bulk copy/move videos across playlists with checkboxes. Export/import playlists as JSON. The missing YouTube power-user tool.
 // @author       dudebot
 // @match        https://www.youtube.com/*
@@ -253,11 +253,13 @@
       let resp = await innertube.browse({ browseId: `VL${playlistId}` });
       const header = this._extractHeader(resp);
       let renderers = this._findPlaylistRenderers(resp);
-      // Parse-drift sentinel: if the response carries playlist metadata but
-      // we recognize no item renderer path on the very first page, raise
-      // loud rather than returning an empty playlist (which would silently
-      // poison exports, dedupe previews, and setVideoId resolution).
-      if (header.title && !renderers && header.itemCount !== 0) {
+      // Parse-drift sentinel: only cry "drift" when the header explicitly says
+      // there ARE items (>0) but we found none. A genuinely empty playlist has
+      // itemCount 0 or an unparseable "No videos" count (null); those must return
+      // empty rather than throw — otherwise adding to / copying into any empty
+      // playlist breaks at the pre-count read. Drift with a positive count would
+      // still silently poison exports, dedupe previews, and setVideoId resolution.
+      if (header.title && !renderers && header.itemCount > 0) {
         throw new Error(`Playlist parse drift: header recognized but no item renderers found (playlistId=${playlistId})`);
       }
       const seenTokens = new Set();
@@ -583,8 +585,16 @@
     clearSelection() { this._selected.clear(); this._refreshCheckboxes(); this._emit(); },
     getSelection() { return new Map(this._selected); },
 
+    // Playlist rows scoped to the playlist's OWN list. YouTube renders the
+    // "Recommended videos" section below using the same ytd-playlist-video-renderer
+    // tag; including those would let Select-all / bulk ops act on non-playlist items.
+    _rows() {
+      const list = document.querySelector('ytd-playlist-video-list-renderer');
+      return list ? list.querySelectorAll('ytd-playlist-video-renderer') : [];
+    },
+
     _refreshCheckboxes() {
-      const rows = document.querySelectorAll('ytd-playlist-video-renderer');
+      const rows = this._rows();
       rows.forEach(r => {
         const rowKey = r.dataset.ytpmRowKey;
         const cb = r.querySelector('.ytpm-cb');
@@ -612,7 +622,7 @@
     },
 
     injectCheckboxes() {
-      const rows = document.querySelectorAll('ytd-playlist-video-renderer');
+      const rows = this._rows();
       rows.forEach(row => {
         if (row.querySelector('.ytpm-cb')) return;
         if (!row.dataset.ytpmRowKey) {
@@ -645,7 +655,7 @@
     },
 
     selectAll() {
-      const rows = document.querySelectorAll('ytd-playlist-video-renderer');
+      const rows = this._rows();
       rows.forEach(row => {
         if (!row.dataset.ytpmRowKey) {
           row.dataset.ytpmRowKey = `r${++this._rowSeq}`;
@@ -779,7 +789,7 @@
           </div>
           <div class="destpicker" id="destpicker" style="display:none"></div>
           <div class="log" id="log"></div>
-          <div class="hint">alpha v0.1.5</div>
+          <div class="hint">alpha v0.1.6</div>
         </div>
       `);
 
@@ -1220,7 +1230,7 @@
     try {
       ui.mount();
       dom.start();
-      console.log('[YTPM] mounted (v0.1.5)');
+      console.log('[YTPM] mounted (v0.1.6)');
     } catch (e) {
       console.error('[YTPM] mount failed:', e);
     }
